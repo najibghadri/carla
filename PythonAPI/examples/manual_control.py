@@ -12,6 +12,10 @@
 """
 Welcome to CARLA manual control.
 
+If you want traffic start spawn_npc.py, use --sync argument
+if you have low fps rate to keep physics simulation on fixed FPS.
+Default fixed FPS is 30, but you can change it in code.
+
 Use ARROWS or WASD keys for control.
 
     W            : throttle
@@ -85,6 +89,7 @@ import math
 import random
 import re
 import weakref
+import threading
 
 try:
     import pygame
@@ -119,6 +124,7 @@ try:
     from pygame.locals import K_w
     from pygame.locals import K_l
     from pygame.locals import K_i
+    from pygame.locals import K_j
     from pygame.locals import K_z
     from pygame.locals import K_x
     from pygame.locals import K_MINUS
@@ -188,8 +194,9 @@ class World(object):
         # Keep same camera config if the camera manager exists.
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-        # Get a random blueprint.
-        blueprint = random.choice(self.world.get_blueprint_library().filter(self._actor_filter))
+        # Set veichle to Tesla Model 3 as multicam camera positions are optimal for it.
+        blueprint = self.world.get_blueprint_library().find('vehicle.tesla.model3')
+        # blueprint = random.choice(self.world.get_blueprint_library().filter(self._actor_filter))
         blueprint.set_attribute('role_name', self.actor_role_name)
         if blueprint.has_attribute('color'):
             color = random.choice(blueprint.get_attribute('color').recommended_values)
@@ -229,6 +236,9 @@ class World(object):
         self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
+         #Set up Multicam Recorder
+        self.multicam_recorder = MultiCameraRecorder(self.player, self.hud, self._gamma)
+        
         actor_type = get_actor_display_name(self.player)
         self.hud.notification(actor_type)
 
@@ -257,7 +267,8 @@ class World(object):
         self.camera_manager.sensor.destroy()
         self.camera_manager.sensor = None
         self.camera_manager.index = None
-
+        self.multicam_recorder.destroy_cams()
+        
     def destroy(self):
         if self.radar_sensor is not None:
             self.toggle_radar()
@@ -271,7 +282,7 @@ class World(object):
         for actor in actors:
             if actor is not None:
                 actor.destroy()
-
+        self.multicam_recorder.destroy_cams()
 
 # ==============================================================================
 # -- KeyboardControl -----------------------------------------------------------
@@ -316,6 +327,8 @@ class KeyboardControl(object):
                     world.hud.toggle_info()
                 elif event.key == K_h or (event.key == K_SLASH and pygame.key.get_mods() & KMOD_SHIFT):
                     world.hud.help.toggle()
+                elif event.key == K_TAB and pygame.key.get_mods() & KMOD_SHIFT:
+                    world.camera_manager.toggle_prev_camera()
                 elif event.key == K_TAB:
                     world.camera_manager.toggle_camera()
                 elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT:
@@ -328,11 +341,15 @@ class KeyboardControl(object):
                     world.camera_manager.next_sensor()
                 elif event.key == K_n:
                     world.camera_manager.next_sensor()
+                elif event.key == K_j:
+                    world.camera_manager.prev_sensor()
                 elif event.key > K_0 and event.key <= K_9:
                     world.camera_manager.set_sensor(event.key - 1 - K_0)
-                elif event.key == K_r and not (pygame.key.get_mods() & KMOD_CTRL):
-                    world.camera_manager.toggle_recording()
-                elif event.key == K_r and (pygame.key.get_mods() & KMOD_CTRL):
+                elif event.key == K_r:
+                    # Both recorders started together. 
+                    # Useful for those who want to work with
+                    # the log api later, maybe for ground truth data
+                    world.multicam_recorder.toggle_recording()
                     if (world.recording_enabled):
                         client.stop_recorder()
                         world.recording_enabled = False
@@ -433,16 +450,7 @@ class KeyboardControl(object):
             world.player.apply_control(self._control)
 
     def _parse_vehicle_keys(self, keys, milliseconds):
-        if keys[K_UP] or keys[K_w]:
-            self._control.throttle = min(self._control.throttle + 0.01, 1)
-        else:
-            self._control.throttle = 0.0
-
-        if keys[K_DOWN] or keys[K_s]:
-            self._control.brake = min(self._control.brake + 0.2, 1)
-        else:
-            self._control.brake = 0
-
+        self._control.throttle = 1.0 if keys[K_UP] or keys[K_w] else 0.0
         steer_increment = 5e-4 * milliseconds
         if keys[K_LEFT] or keys[K_a]:
             if self._steer_cache > 0:
@@ -458,6 +466,7 @@ class KeyboardControl(object):
             self._steer_cache = 0.0
         self._steer_cache = min(0.7, max(-0.7, self._steer_cache))
         self._control.steer = round(self._steer_cache, 1)
+        self._control.brake = 1.0 if keys[K_DOWN] or keys[K_s] else 0.0
         self._control.hand_brake = keys[K_SPACE]
 
     def _parse_walker_keys(self, keys, milliseconds, world):
@@ -498,12 +507,14 @@ class HUD(object):
         self._font_mono = pygame.font.Font(mono, 12 if os.name == 'nt' else 14)
         self._notifications = FadingText(font, (width, 40), (0, height - 40))
         self.help = HelpText(pygame.font.Font(mono, 16), width, height)
-        self.server_fps = 0
         self.frame = 0
         self.simulation_time = 0
         self._show_info = True
         self._info_text = []
+        self.server_fps = 0
+        self.camera_fps = 0 # FPS of the sensor.listen callback 
         self._server_clock = pygame.time.Clock()
+        self._camera_clock = pygame.time.Clock()
 
     def on_world_tick(self, timestamp):
         self._server_clock.tick()
@@ -531,6 +542,7 @@ class HUD(object):
         self._info_text = [
             'Server:  % 16.0f FPS' % self.server_fps,
             'Client:  % 16.0f FPS' % clock.get_fps(),
+            'Camera:  % 16.0f FPS' % self.camera_fps,
             '',
             'Vehicle: % 20s' % get_actor_display_name(world.player, truncate=20),
             'Map:     % 20s' % world.map.name,
@@ -620,6 +632,9 @@ class HUD(object):
         self._notifications.render(display)
         self.help.render(display)
 
+    def notify_camera_tick(self):
+        self._camera_clock.tick()
+        self.camera_fps = self._camera_clock.get_fps()
 
 # ==============================================================================
 # -- FadingText ----------------------------------------------------------------
@@ -878,9 +893,115 @@ class RadarSensor(object):
                 color=carla.Color(r, g, b))
 
 # ==============================================================================
-# -- CameraManager -------------------------------------------------------------
+# -- MultiCameraRecorder -------------------------------------------------------------
 # ==============================================================================
 
+class MultiCameraRecorder(object):
+    def __init__(self, parent_actor, hud, gamma_correction):
+        self.sensor = None
+        self.surface = None
+        self._parent = parent_actor
+        self.hud = hud
+        self.recording = False
+        self._camera_transforms = [
+            # Shape of camera config:
+            #
+            #      LC1/FL  FR/RC1
+            #
+            # LC2/L1             RC2/R1
+            #
+            # L2                     R2
+            #
+            # Front stereo
+            (carla.Transform(carla.Location(x=0.3, y=-0.4, z=1.5), carla.Rotation(yaw=0.0)), carla.AttachmentType.Rigid, 'FL'),
+            (carla.Transform(carla.Location(x=0.3, y=0.4, z=1.5), carla.Rotation(yaw=0.0)), carla.AttachmentType.Rigid, 'FR'),
+
+            # Right Corner stereo
+            (carla.Transform(carla.Location(x=0.3, y=0.4, z=1.5), carla.Rotation(yaw=45.0)), carla.AttachmentType.Rigid, 'RC1'),
+            (carla.Transform(carla.Location(x=0.0, y=0.7, z=1.5), carla.Rotation(yaw=45.0)), carla.AttachmentType.Rigid, 'RC2'),
+
+            # Right stereo
+            (carla.Transform(carla.Location(x=0.0, y=0.7, z=1.5), carla.Rotation(yaw=90.0)), carla.AttachmentType.Rigid, 'R1'),
+            (carla.Transform(carla.Location(x=-0.5, y=0.7, z=1.5), carla.Rotation(yaw=90.0)), carla.AttachmentType.Rigid, 'R2'),
+
+            # Left Corner stereo
+            (carla.Transform(carla.Location(x=0.3, y=-0.4, z=1.5), carla.Rotation(yaw=-45.0)), carla.AttachmentType.Rigid, 'LC1'),
+            (carla.Transform(carla.Location(x=0.0, y=-0.7, z=1.5), carla.Rotation(yaw=-45.0)), carla.AttachmentType.Rigid, 'LC2'),
+
+            # Left stereo
+            (carla.Transform(carla.Location(x=0.0, y=-0.7, z=1.5), carla.Rotation(yaw=-90.0)), carla.AttachmentType.Rigid, 'L1'),
+            (carla.Transform(carla.Location(x=-0.5, y=-0.7, z=1.5), carla.Rotation(yaw=-90.0)), carla.AttachmentType.Rigid, 'L2'),
+            ]
+        self.sensors = []
+        self.transform_index = 1
+        self.sensor = ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}]
+        world = self._parent.get_world()
+        bp_library = world.get_blueprint_library()
+
+        bp = bp_library.find(self.sensor[0])
+        if self.sensor[0].startswith('sensor.camera'):
+            bp.set_attribute('fov', '90')
+            bp.set_attribute('image_size_x', str(hud.dim[0]))
+            bp.set_attribute('image_size_y', str(hud.dim[1]))
+            if bp.has_attribute('gamma'):
+                bp.set_attribute('gamma', str(gamma_correction))
+            for attr_name, attr_value in self.sensor[3].items():
+                bp.set_attribute(attr_name, attr_value)
+        self.sensor.append(bp)
+        # Semaphore to synchronize the cameras, 
+        # the semaphore is released once by each camera, 
+        # and once server loop continues from trying to 
+        # acquire it as many times as many cameras we have
+        # it ticks again, and again the cameras release, and so on.
+        self.semaphore = threading.BoundedSemaphore(len(self._camera_transforms))
+
+    def init_cams(self):
+        for transform in self._camera_transforms:
+            sensor = self._parent.get_world().spawn_actor(
+                self.sensor[-1],
+                transform[0],
+                attach_to=self._parent,
+                attachment_type=transform[1])
+            weak_self = weakref.ref(self)
+            sensor.listen(lambda image, label=transform[2]: MultiCameraRecorder._parse_image(weak_self, image, label))
+            self.sensors.append(sensor)
+
+    def destroy_cams(self):
+        for s in self.sensors:
+                s.destroy()
+        self.sensors = []
+        self.semaphore = threading.BoundedSemaphore(len(self._camera_transforms)) # reset
+    
+    def wait(self):
+        for _ in range(0, len(self._camera_transforms)):
+            self.semaphore.acquire()
+
+    def toggle_recording(self):
+        if(not self.recording):
+            self.init_cams()
+            self.recording = not self.recording
+        else:
+            self.recording = not self.recording
+            self.destroy_cams()
+        
+        self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
+
+    @staticmethod
+    def _parse_image(weak_self, image, label):
+        self = weak_self()
+        if not self:
+            return
+        if self.recording:
+            image.save_to_disk('_out/%08d%s.jpg' % (image.frame, label))
+            try:
+                self.semaphore.release() 
+            except ValueError:
+                print("Semaphore over-released. No problem if this is on exit")
+
+
+# ==============================================================================
+# -- CameraManager -------------------------------------------------------------
+# ==============================================================================
 
 class CameraManager(object):
     def __init__(self, parent_actor, hud, gamma_correction):
@@ -896,7 +1017,8 @@ class CameraManager(object):
             (carla.Transform(carla.Location(x=1.6, z=1.7)), Attachment.Rigid),
             (carla.Transform(carla.Location(x=5.5, y=1.5, z=1.5)), Attachment.SpringArm),
             (carla.Transform(carla.Location(x=-8.0, z=6.0), carla.Rotation(pitch=6.0)), Attachment.SpringArm),
-            (carla.Transform(carla.Location(x=-1, y=-bound_y, z=0.5)), Attachment.Rigid)]
+            (carla.Transform(carla.Location(x=-1, y=-bound_y, z=0.5)), Attachment.Rigid)
+            ]
         self.transform_index = 1
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}],
@@ -911,12 +1033,14 @@ class CameraManager(object):
                 {'lens_circle_multiplier': '3.0',
                 'lens_circle_falloff': '3.0',
                 'chromatic_aberration_intensity': '0.5',
-                'chromatic_aberration_offset': '0'}]]
+                'chromatic_aberration_offset': '0'}]
+            ]
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
         for item in self.sensors:
             bp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
+                bp.set_attribute('fov', '90')
                 bp.set_attribute('image_size_x', str(hud.dim[0]))
                 bp.set_attribute('image_size_y', str(hud.dim[1]))
                 if bp.has_attribute('gamma'):
@@ -930,6 +1054,10 @@ class CameraManager(object):
 
     def toggle_camera(self):
         self.transform_index = (self.transform_index + 1) % len(self._camera_transforms)
+        self.set_sensor(self.index, notify=False, force_respawn=True)
+
+    def toggle_prev_camera(self):
+        self.transform_index = (self.transform_index + -1) % len(self._camera_transforms)
         self.set_sensor(self.index, notify=False, force_respawn=True)
 
     def set_sensor(self, index, notify=True, force_respawn=False):
@@ -955,7 +1083,11 @@ class CameraManager(object):
 
     def next_sensor(self):
         self.set_sensor(self.index + 1)
+    
+    def prev_sensor(self):
+        self.set_sensor(self.index + -1)
 
+    # This is not used, but can be hooked back to K_R event
     def toggle_recording(self):
         self.recording = not self.recording
         self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
@@ -967,6 +1099,7 @@ class CameraManager(object):
     @staticmethod
     def _parse_image(weak_self, image):
         self = weak_self()
+        self.hud.notify_camera_tick()
         if not self:
             return
         if self.sensors[self.index][0].startswith('sensor.lidar'):
@@ -989,23 +1122,21 @@ class CameraManager(object):
             array = array[:, :, :3]
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        if self.recording:
-            image.save_to_disk('_out/%08d' % image.frame)
 
 
 # ==============================================================================
 # -- game_loop() ---------------------------------------------------------------
 # ==============================================================================
 
-
 def game_loop(args):
     pygame.init()
     pygame.font.init()
     world = None
+    server_thread = None
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(2.0)
+        client.set_timeout(10.0)
 
         display = pygame.display.set_mode(
             (args.width, args.height),
@@ -1015,16 +1146,49 @@ def game_loop(args):
         world = World(client.get_world(), hud, args)
         controller = KeyboardControl(world, args.autopilot)
 
-        clock = pygame.time.Clock()
+        # Use fixed delta with sync mode 
+        # when using it with traffic
+        world.world.apply_settings(carla.WorldSettings(
+            no_rendering_mode=False,
+            synchronous_mode=True,
+            fixed_delta_seconds=1.0/30.0,
+            ))
+
+        # Mrore interesting traffic self settings
+        traffic_manager = client.get_trafficmanager(8000)
+        traffic_manager.ignore_vehicles_percentage(world.player, 2.0) # 2%
+        traffic_manager.ignore_walkers_percentage(world.player, 2.0) # 2%
+        traffic_manager.ignore_lights_percentage(world.player, 2.0) # 2%
+        traffic_manager.vehicle_percentage_speed_difference(world.player,  0.0)
+        
+        running = None
+        # To make the our GUI client independent from the 
+        # server FPS, but still have the control here
+        # for the multicam recorder we have a loop thread:
+        def synchronous_recorder_ticker():
+            while running:
+                if world.multicam_recorder.recording:
+                    world.multicam_recorder.wait()
+                world.world.tick()
+    
+        client_clock = pygame.time.Clock()
+
+        server_thread = threading.Thread(target=synchronous_recorder_ticker)
+        running = True
+        server_thread.start()
         while True:
-            clock.tick_busy_loop(60)
-            if controller.parse_events(client, world, clock):
+            client_clock.tick(60) # Not important to set the client to busy loop imo
+            if controller.parse_events(client, world, client_clock):
                 return
-            world.tick(clock)
+            world.tick(client_clock)
             world.render(display)
             pygame.display.flip()
-
+        
     finally:
+
+        running = False
+        if server_thread is not None:
+            server_thread.join()
 
         if (world and world.recording_enabled):
             client.stop_recorder()
